@@ -28,6 +28,18 @@ then
     fi
 fi
 
+usage() {
+    echo "Usage: $(basename "$0") /dev/yourUSBdrive system_image.tar [/path/to/configfile.tar.gz] [root end cap size in GB]" >&2
+    echo >&2
+    echo "  /dev/yourUSBdrive  Target USB device (whole disk, e.g. /dev/sdb or /dev/disk4)." >&2
+    echo "  system_image.tar   EdgeOS release tarball (required)." >&2
+    echo "  configfile.tar.gz  Optional backup config to include on the drive." >&2
+    echo "  root end cap size  Optional cap on the root partition size, in GB." >&2
+    echo "                     Defaults to filling the drive." >&2
+    echo >&2
+    echo "To set a root end cap size without a config, pass \"-\" as the third parameter." >&2
+}
+
 # Tag the root partition (slice 2) as Linux (0x83) in the MBR, matching what
 # parted's "mkpart ext3" does on Linux, so the router's kernel treats it as the
 # ext3 root filesystem. diskutil only knows about its own filesystem types, so we
@@ -61,9 +73,7 @@ ROOT_MNT=/mnt/root
 
 if [[ -z "$TARBALL" ]]
 then
-    echo "Usage: ./mkeosdrive /dev/yourUSBdrive system_image.tar <optional 3rd parameter: /path/to/configfile.tar.gz>\
-    <optional 4th parameter: desired end cap size of root partition in GB>"
-    echo "If you want to provide a root partition end cap size but no config, use \"-\" without the quotes as the third parameter."
+    usage
     exit 1
 fi
 

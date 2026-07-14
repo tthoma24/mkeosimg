@@ -25,6 +25,16 @@ then
     fi
 fi
 
+usage() {
+    echo "Usage: $(basename "$0") system_image.tar [/path/to/configfile.tar.gz] [image size in GB]" >&2
+    echo >&2
+    echo "  system_image.tar   EdgeOS release tarball (required)." >&2
+    echo "  configfile.tar.gz  Optional backup config to include in the image." >&2
+    echo "  image size in GB   Optional total image size. Defaults to 2 GB." >&2
+    echo >&2
+    echo "To set an image size without a config, pass \"-\" as the second parameter." >&2
+}
+
 # Tag the root partition (slice 2) as Linux (0x83) in the MBR, matching what
 # parted's "mkpart ext3" does on Linux, so the router's kernel treats it as the
 # ext3 root filesystem. diskutil only knows about its own filesystem types, so we
@@ -47,9 +57,7 @@ ROOT_MNT=/mnt/root
 
 if [[ -z "$TARBALL" ]]
 then
-    echo "Usage: ./mkeosimg system_image.tar <optional 2nd parameter: /path/to/configfile.tar.gz> \
-    <optional 3rd parameter: desired image size in GB>"
-    echo "If you want to provide an image size but no config, use \"-\" without the quotes as the second paramenter."
+    usage
     exit 1
 fi
 
