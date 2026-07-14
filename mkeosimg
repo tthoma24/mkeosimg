@@ -6,12 +6,41 @@ then
     exit 1
 fi
 
+OS=$(uname -s)
+
+# macOS can't create an ext3 filesystem with its native tools, so mke2fs
+# (from e2fsprogs) is the one extra tool we need. Partitioning and the FAT32
+# boot filesystem are handled by the built-in diskutil/fdisk. Check up front
+# and point the user at both common package managers if it is missing.
+if [ "$OS" = "Darwin" ]
+then
+    if ! command -v mke2fs >/dev/null 2>&1
+    then
+        echo "Missing required tool on macOS: mke2fs"
+        echo "Install it with one of:"
+        echo "    brew install e2fsprogs"
+        echo "    sudo port install e2fsprogs"
+        echo "(ext3 is not supported by macOS natively.)"
+        exit 1
+    fi
+fi
+
+# Tag the root partition (slice 2) as Linux (0x83) in the MBR, matching what
+# parted's "mkpart ext3" does on Linux, so the router's kernel treats it as the
+# ext3 root filesystem. diskutil only knows about its own filesystem types, so we
+# fix the partition-type byte with the built-in fdisk afterwards.
+set_linux_root_type() {
+    fdisk -y -e "$DEVICE" >/dev/null 2>&1 <<'FDISK'
+setpid 2
+83
+write
+quit
+FDISK
+}
+
 TARBALL=${1}
 CONFIG=${2}
 DRIVESIZE=${3}
-DEVICE=$(losetup -f)
-DEVICE_BOOT=${DEVICE}p1
-DEVICE_ROOT=${DEVICE}p2
 
 BOOT_MNT=/mnt/boot
 ROOT_MNT=/mnt/root
@@ -24,28 +53,39 @@ then
     exit 1
 fi
 
-mkdir -p $BOOT_MNT
-mkdir -p $ROOT_MNT
+if [ "$OS" = "Darwin" ]
+then
+    # macOS mounts partitions under temporary directories; nothing lives at a
+    # fixed /mnt path.
+    BOOT_MNT=$(mktemp -d)
+else
+    mkdir -p $BOOT_MNT
+    mkdir -p $ROOT_MNT
 
-# unmount only if already mounted
-grep -qs "$BOOT_MNT" /proc/mounts && umount $BOOT_MNT
-grep -qs "$ROOT_MNT" /proc/mounts && umount $ROOT_MNT
+    # unmount only if already mounted
+    grep -qs "$BOOT_MNT" /proc/mounts && umount $BOOT_MNT
+    grep -qs "$ROOT_MNT" /proc/mounts && umount $ROOT_MNT
+fi
 
 DIR=$(mktemp -d)
+# Staging directory that becomes the ext3 root partition contents (macOS path).
+STAGE=$(mktemp -d)
+# Loop/disk device, set once the image is attached.
+DEVICE=""
 
 function cleanup {
-    if [ -d "$DIR" ]
+    # On macOS make sure the image is detached before removing scratch dirs.
+    if [ "$OS" = "Darwin" ] && [ -n "$DEVICE" ]
     then
-        rm -rf "$DIR"
+        hdiutil detach "$DEVICE" >/dev/null 2>&1
     fi
-    if [ -d "$BOOT_MNT" ]
-    then
-        rm -rf "$BOOT_MNT"
-    fi
-    if [ -d "$ROOT_MNT" ]
-    then
-        rm -rf "$ROOT_MNT"
-    fi
+    for d in "$DIR" "$STAGE" "$BOOT_MNT" "$ROOT_MNT"
+    do
+        if [ -d "$d" ]
+        then
+            rm -rf "$d"
+        fi
+    done
 }
 trap cleanup EXIT
 
@@ -68,18 +108,44 @@ fi
 
 echo "Creating $IMG with a size of $DRIVESIZE GB"
 (( SIZE = DRIVESIZE * 1024 ))
-dd if=/dev/zero of="$IMG" bs=1M count=0 seek="$SIZE"
-losetup "$DEVICE" "$IMG"
-parted --script "$DEVICE" mktable msdos
-parted --script "$DEVICE" mkpart primary fat32 1 150MB
-parted --script "$DEVICE" mkpart primary ext3 150MB 100%
+dd if=/dev/zero of="$IMG" bs=1048576 count=0 seek="$SIZE"
+
+if [ "$OS" = "Darwin" ]
+then
+    # Attach the image as a disk device (without mounting) so diskutil can
+    # partition it; slices appear as /dev/diskNsX.
+    DEVICE=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$IMG" | head -1 | awk '{print $1}')
+    DEVICE_BOOT=${DEVICE}s1
+    DEVICE_ROOT=${DEVICE}s2
+
+    # Create an MBR with a 150 MB FAT32 boot partition and the rest for root.
+    # diskutil formats both as FAT32; we reformat root as ext3 below and fix its
+    # partition type. This is why the boot partition needs no separate mkfs step.
+    diskutil partitionDisk "$DEVICE" MBR "MS-DOS FAT32" BOOT 150M "MS-DOS FAT32" ROOT R
+else
+    DEVICE=$(losetup -f)
+    DEVICE_BOOT=${DEVICE}p1
+    DEVICE_ROOT=${DEVICE}p2
+
+    losetup "$DEVICE" "$IMG"
+    parted --script "$DEVICE" mktable msdos
+    parted --script "$DEVICE" mkpart primary fat32 1 150MB
+    parted --script "$DEVICE" mkpart primary ext3 150MB 100%
+fi
 
 echo "Formatting $IMG"
-mkfs.msdos -F 32 "$DEVICE_BOOT"
-mkfs.ext3 -q "$DEVICE_ROOT"
+if [ "$OS" = "Darwin" ]
+then
+    # diskutil auto-mounts the freshly created FAT partitions; unmount them so we
+    # can reformat root as ext3 and copy files without interference.
+    diskutil unmountDisk "$DEVICE" >/dev/null
+else
+    mkfs.msdos -F 32 "$DEVICE_BOOT"
+    mkfs.ext3 -q "$DEVICE_ROOT"
 
-mount "$DEVICE_BOOT" $BOOT_MNT
-mount "$DEVICE_ROOT" $ROOT_MNT
+    mount "$DEVICE_BOOT" $BOOT_MNT
+    mount "$DEVICE_ROOT" $ROOT_MNT
+fi
 
 echo "Unpacking EdgeOS release image"
 tar xf "$TARBALL" -C "$DIR"
@@ -92,10 +158,6 @@ if [ "$(md5sum "$DIR"/vmlinux.tmp | awk -F ' ' '{print $1}')" != \
     exit 1
 fi
 
-echo "Copying EdgeOS kernel to boot partition"
-cp "$DIR"/vmlinux.tmp $BOOT_MNT/vmlinux.64
-cp "$DIR"/vmlinux.tmp.md5 $BOOT_MNT/vmlinux.64.md5
-
 ####### System
 echo "Verifying EdgeOS system image"
 if [ "$(md5sum "$DIR"/squashfs.tmp | awk -F ' ' '{print $1}')" != \
@@ -104,32 +166,79 @@ if [ "$(md5sum "$DIR"/squashfs.tmp | awk -F ' ' '{print $1}')" != \
     exit 1
 fi
 
-echo "Copying EdgeOS system image to root partition"
-mv "$DIR"/squashfs.tmp $ROOT_MNT/squashfs.img
-mv "$DIR"/squashfs.tmp.md5 $ROOT_MNT/squashfs.img.md5
-
-echo "Copying version file to the root partition"
-mv "$DIR"/version.tmp $ROOT_MNT/version
-
-# Writable data dir
-echo "Creating EdgeOS writable data directories"
-mkdir $ROOT_MNT/w
-mkdir $ROOT_MNT/www
-
-chown 33:0 $ROOT_MNT/www
-
-####### Extract config
-if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]
+if [ "$OS" = "Darwin" ]
 then
-    tar xf "$CONFIG" -C $ROOT_MNT/w
+    # Assemble the root partition contents in a staging directory, then create and
+    # populate the ext3 filesystem in one step (no ext3 mount needed on macOS).
+    echo "Copying EdgeOS system image to root partition"
+    mv "$DIR"/squashfs.tmp "$STAGE"/squashfs.img
+    mv "$DIR"/squashfs.tmp.md5 "$STAGE"/squashfs.img.md5
+
+    echo "Copying version file to the root partition"
+    mv "$DIR"/version.tmp "$STAGE"/version
+
+    # Writable data dir
+    echo "Creating EdgeOS writable data directories"
+    mkdir "$STAGE"/w
+    mkdir "$STAGE"/www
+    chown 33:0 "$STAGE"/www
+
+    ####### Extract config
+    if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]
+    then
+        tar xf "$CONFIG" -C "$STAGE"/w
+    fi
+
+    echo "Creating ext3 root filesystem"
+    # -F: diskutil already put a FAT filesystem here, so skip the interactive
+    # "overwrite existing filesystem?" prompt (we are replacing it on purpose).
+    mke2fs -F -t ext3 -q -d "$STAGE" "$DEVICE_ROOT"
+
+    echo "Copying EdgeOS kernel to boot partition"
+    diskutil mount -mountPoint "$BOOT_MNT" "$DEVICE_BOOT" >/dev/null
+    cp "$DIR"/vmlinux.tmp "$BOOT_MNT"/vmlinux.64
+    cp "$DIR"/vmlinux.tmp.md5 "$BOOT_MNT"/vmlinux.64.md5
+    diskutil unmount "$DEVICE_BOOT" >/dev/null
+
+    # Mark the root partition as Linux so the router recognizes it.
+    set_linux_root_type
+
+    # Unhook img
+    diskutil unmountDisk "$DEVICE" >/dev/null 2>&1 || true
+    hdiutil detach "$DEVICE"
+    DEVICE=""
+else
+    echo "Copying EdgeOS kernel to boot partition"
+    cp "$DIR"/vmlinux.tmp $BOOT_MNT/vmlinux.64
+    cp "$DIR"/vmlinux.tmp.md5 $BOOT_MNT/vmlinux.64.md5
+
+    echo "Copying EdgeOS system image to root partition"
+    mv "$DIR"/squashfs.tmp $ROOT_MNT/squashfs.img
+    mv "$DIR"/squashfs.tmp.md5 $ROOT_MNT/squashfs.img.md5
+
+    echo "Copying version file to the root partition"
+    mv "$DIR"/version.tmp $ROOT_MNT/version
+
+    # Writable data dir
+    echo "Creating EdgeOS writable data directories"
+    mkdir $ROOT_MNT/w
+    mkdir $ROOT_MNT/www
+
+    chown 33:0 $ROOT_MNT/www
+
+    ####### Extract config
+    if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]
+    then
+        tar xf "$CONFIG" -C $ROOT_MNT/w
+    fi
+
+    # These need to happen before the losetup -d, or else the changes won't be
+    # written to disk
+    umount $ROOT_MNT
+    umount $BOOT_MNT
+
+    # Unhook img
+    losetup -d "$DEVICE"
 fi
-
-# These need to happen before the losetup -d, or else the changes won't be
-# written to disk
-umount $ROOT_MNT
-umount $BOOT_MNT
-
-# Unhook img
-losetup -d "$DEVICE"
 
 echo "Done."
