@@ -2,10 +2,27 @@
 
 Your EdgeRouter's internal USB drive died, and you don't have a spare
 couple hours to figure out how TFTP works. Run this script instead *on
-your nearest Linux machine* and generate a .img that you can dd straight
-to a new USB drive.
+your nearest Linux or macOS machine* and generate a .img that you can dd
+straight to a new USB drive.
 
 If you want to create a USB boot drive directly, use `./mkeosdrive` instead.
+
+## macOS
+
+The scripts run on macOS as well as Linux. macOS can't create the ext3 root
+filesystem that the router needs with its native tools, so install `e2fsprogs`
+(which provides `mke2fs`) first, with either package manager:
+
+* Homebrew: `brew install e2fsprogs`
+* MacPorts: `sudo port install e2fsprogs`
+
+That's the only extra dependency — partitioning and the FAT32 boot filesystem
+are handled by the built-in `diskutil`/`fdisk`. The scripts detect macOS
+automatically and will tell you if `mke2fs` is missing.
+
+When using `./mkeosdrive`, the target is a whole disk like `/dev/disk4` —
+find it with `diskutil list` (be certain you pick your USB drive, not your
+system disk).
 
 # Usage
 

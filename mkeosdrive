@@ -9,90 +9,174 @@ then
     exit 1
 fi
 
+OS=$(uname -s)
+
+# macOS can't create an ext3 filesystem with its native tools, so mke2fs
+# (from e2fsprogs) is the one extra tool we need. Partitioning and the FAT32
+# boot filesystem are handled by the built-in diskutil/fdisk. Check up front
+# and point the user at both common package managers if it is missing.
+if [ "$OS" = "Darwin" ]
+then
+    if ! command -v mke2fs >/dev/null 2>&1
+    then
+        echo "Missing required tool on macOS: mke2fs"
+        echo "Install it with one of:"
+        echo "    brew install e2fsprogs"
+        echo "    sudo port install e2fsprogs"
+        echo "(ext3 is not supported by macOS natively.)"
+        exit 1
+    fi
+fi
+
+usage() {
+    echo "Usage: $(basename "$0") /dev/yourUSBdrive system_image.tar [/path/to/configfile.tar.gz] [root end cap size in GB]" >&2
+    echo >&2
+    echo "  /dev/yourUSBdrive  Target USB device (whole disk, e.g. /dev/sdb or /dev/disk4)." >&2
+    echo "  system_image.tar   EdgeOS release tarball (required)." >&2
+    echo "  configfile.tar.gz  Optional backup config to include on the drive." >&2
+    echo "  root end cap size  Optional cap on the root partition size, in GB." >&2
+    echo "                     Defaults to filling the drive." >&2
+    echo >&2
+    echo "To set a root end cap size without a config, pass \"-\" as the third parameter." >&2
+}
+
+# Tag the root partition (slice 2) as Linux (0x83) in the MBR, matching what
+# parted's "mkpart ext3" does on Linux, so the router's kernel treats it as the
+# ext3 root filesystem. diskutil only knows about its own filesystem types, so we
+# fix the partition-type byte with the built-in fdisk afterwards.
+set_linux_root_type() {
+    fdisk -y -e "$DEVICE" >/dev/null 2>&1 <<'FDISK'
+setpid 2
+83
+write
+quit
+FDISK
+}
+
 DEVICE=${1}
 TARBALL=${2}
 CONFIG=${3}
 DRIVESIZE=${4}
 
-DEVICE_BOOT=${DEVICE}1
-DEVICE_ROOT=${DEVICE}2
+if [ "$OS" = "Darwin" ]
+then
+    # macOS disk slices are /dev/diskNs1, /dev/diskNs2
+    DEVICE_BOOT=${DEVICE}s1
+    DEVICE_ROOT=${DEVICE}s2
+else
+    DEVICE_BOOT=${DEVICE}1
+    DEVICE_ROOT=${DEVICE}2
+fi
 
 BOOT_MNT=/mnt/boot
 ROOT_MNT=/mnt/root
 
 if [[ -z "$TARBALL" ]]
 then
-    echo "Usage: ./mkeosdrive /dev/yourUSBdrive system_image.tar <optional 3rd parameter: /path/to/configfile.tar.gz>\
-    <optional 4th parameter: desired end cap size of root partition in GB>"
-    echo "If you want to provide a root partition end cap size but no config, use \"-\" without the quotes as the third parameter."
+    usage
     exit 1
 fi
 
-mkdir -p $BOOT_MNT
-mkdir -p $ROOT_MNT
+if [ "$OS" = "Darwin" ]
+then
+    # macOS mounts partitions under temporary directories; nothing lives at a
+    # fixed /mnt path.
+    BOOT_MNT=$(mktemp -d)
 
-# Unmount all partitions on device
-umount "${DEVICE}"? && echo "Unmounted all partitions on $DEVICE" || echo "no filesystem mounted from $DEVICE"
+    # Unmount all volumes on the target disk (tolerate a disk with none mounted).
+    diskutil unmountDisk "$DEVICE" || true
+else
+    mkdir -p $BOOT_MNT
+    mkdir -p $ROOT_MNT
 
-# Unmount folders only if already mounted
-grep -qs "$BOOT_MNT" /proc/mounts && umount $BOOT_MNT
-grep -qs "$ROOT_MNT" /proc/mounts && umount $ROOT_MNT
+    # Unmount all partitions on device
+    umount "${DEVICE}"? && echo "Unmounted all partitions on $DEVICE" || echo "no filesystem mounted from $DEVICE"
+
+    # Unmount folders only if already mounted
+    grep -qs "$BOOT_MNT" /proc/mounts && umount $BOOT_MNT
+    grep -qs "$ROOT_MNT" /proc/mounts && umount $ROOT_MNT
+fi
 
 DIR=$(mktemp -d)
+# Staging directory that becomes the ext3 root partition contents (macOS path).
+STAGE=$(mktemp -d)
 
 function cleanup {
-    if [ -d "$DIR" ]
-    then
-        rm -rf "$DIR"
-    fi
-    if [ -d "$BOOT_MNT" ]
-    then
-        rm -rf "$BOOT_MNT"
-    fi
-    if [ -d "$ROOT_MNT" ]
-    then
-        rm -rf "$ROOT_MNT"
-    fi
+    for d in "$DIR" "$STAGE" "$BOOT_MNT" "$ROOT_MNT"
+    do
+        if [ -d "$d" ]
+        then
+            rm -rf "$d"
+        fi
+    done
 }
 trap cleanup EXIT
 
 echo "Press any key to continue formatting $DEVICE"
 read -n1 -rsp $'or hit Ctrl+C to exit now...\n'
 
-# deleting existing partiton table first
-dd if=/dev/zero of="$DEVICE" bs=512 count=1 conv=notrunc
-
-echo "Waiting for disk sync..."
-sync
-
-parted --script "$DEVICE" mktable msdos
-parted --script "$DEVICE" mkpart primary fat32 1 150MB
-
-# If no drive size was supplied as a parameter, default to full size root partition
-if [ -n "$DRIVESIZE" ]
+if [ "$OS" = "Darwin" ]
 then
-    echo "Creating root partition with an end cap size of $DRIVESIZE GB"
-    (( SIZE = $DRIVESIZE * 1024 ))
-    parted --script "$DEVICE" mkpart primary ext3 150MB "${SIZE}"MB
+    # Build an MBR with a 150 MB FAT32 boot partition and a root partition.
+    # diskutil formats both as FAT32; we reformat root as ext3 (and fix its
+    # partition type) below, so the boot partition needs no separate mkfs step.
+    if [ -n "$DRIVESIZE" ]
+    then
+        echo "Creating root partition with an end cap size of $DRIVESIZE GB"
+        (( SIZE = DRIVESIZE * 1024 ))
+        (( ROOTMB = SIZE - 150 ))
+        diskutil partitionDisk "$DEVICE" MBR \
+            "MS-DOS FAT32" BOOT 150M \
+            "MS-DOS FAT32" ROOT "${ROOTMB}M" \
+            "Free Space" GAP R
+    else
+        diskutil partitionDisk "$DEVICE" MBR \
+            "MS-DOS FAT32" BOOT 150M \
+            "MS-DOS FAT32" ROOT R
+    fi
+
+    echo "Waiting for disk sync..."
+    sync
+
+    # diskutil auto-mounts the freshly created FAT partitions; unmount them so we
+    # can reformat root as ext3 (below) and copy files without interference.
+    diskutil unmountDisk "$DEVICE"
 else
-    parted --script "$DEVICE" mkpart primary ext3 150MB 100%
+    # deleting existing partiton table first
+    dd if=/dev/zero of="$DEVICE" bs=512 count=1 conv=notrunc
+
+    echo "Waiting for disk sync..."
+    sync
+
+    parted --script "$DEVICE" mktable msdos
+    parted --script "$DEVICE" mkpart primary fat32 1 150MB
+
+    # If no drive size was supplied as a parameter, default to full size root partition
+    if [ -n "$DRIVESIZE" ]
+    then
+        echo "Creating root partition with an end cap size of $DRIVESIZE GB"
+        (( SIZE = DRIVESIZE * 1024 ))
+        parted --script "$DEVICE" mkpart primary ext3 150MB "${SIZE}"MB
+    else
+        parted --script "$DEVICE" mkpart primary ext3 150MB 100%
+    fi
+
+    echo "Waiting for disk sync..."
+    sync
+
+    # Add a delay to allow the system to recognize the new partitions
+    sleep 2
+
+    echo "Formatting $DEVICE partitions..."
+    mkfs.msdos -F 32 "$DEVICE_BOOT"
+    mkfs.ext3 -q "$DEVICE_ROOT"
+
+    echo "Waiting for disk sync..."
+    sync
+
+    mount "$DEVICE_BOOT" $BOOT_MNT
+    mount "$DEVICE_ROOT" $ROOT_MNT
 fi
-
-echo "Waiting for disk sync..."
-sync
-
-# Add a delay to allow the system to recognize the new partitions
-sleep 2
-
-echo "Formatting $DEVICE partitions..."
-mkfs.msdos -F 32 "$DEVICE_BOOT"
-mkfs.ext3 -q "$DEVICE_ROOT"
-
-echo "Waiting for disk sync..."
-sync
-
-mount "$DEVICE_BOOT" $BOOT_MNT
-mount "$DEVICE_ROOT" $ROOT_MNT
 
 echo "Unpacking EdgeOS release image"
 tar xf "$TARBALL" -C "$DIR"
@@ -105,10 +189,6 @@ if [ "$(md5sum "$DIR"/vmlinux.tmp | awk -F ' ' '{print $1}')" != \
     exit 1
 fi
 
-echo "Copying EdgeOS kernel to boot partition"
-cp "$DIR"/vmlinux.tmp $BOOT_MNT/vmlinux.64
-cp "$DIR"/vmlinux.tmp.md5 $BOOT_MNT/vmlinux.64.md5
-
 ####### System
 echo "Verifying EdgeOS system image"
 if [ "$(md5sum "$DIR"/squashfs.tmp | awk -F ' ' '{print $1}')" != \
@@ -117,34 +197,87 @@ if [ "$(md5sum "$DIR"/squashfs.tmp | awk -F ' ' '{print $1}')" != \
     exit 1
 fi
 
-echo "Copying EdgeOS system image to root partition"
-mv "$DIR"/squashfs.tmp $ROOT_MNT/squashfs.img
-mv "$DIR"/squashfs.tmp.md5 $ROOT_MNT/squashfs.img.md5
-
-echo "Copying version file to the root partition"
-mv "$DIR"/version.tmp $ROOT_MNT/version
-
-# Writable data dir
-echo "Creating EdgeOS writable data directories"
-mkdir $ROOT_MNT/w
-mkdir $ROOT_MNT/www
-
-chown 33:0 $ROOT_MNT/www
-
-####### Extract config
-if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]
+if [ "$OS" = "Darwin" ]
 then
-    echo "Config archive $CONFIG was provided, extracting it to the root partition..."
-    tar xf "$CONFIG" -C $ROOT_MNT/w
+    # Assemble the root partition contents in a staging directory, then create and
+    # populate the ext3 filesystem in one step (no ext3 mount needed on macOS).
+    echo "Copying EdgeOS system image to root partition"
+    mv "$DIR"/squashfs.tmp "$STAGE"/squashfs.img
+    mv "$DIR"/squashfs.tmp.md5 "$STAGE"/squashfs.img.md5
+
+    echo "Copying version file to the root partition"
+    mv "$DIR"/version.tmp "$STAGE"/version
+
+    # Writable data dir
+    echo "Creating EdgeOS writable data directories"
+    mkdir "$STAGE"/w
+    mkdir "$STAGE"/www
+    chown 33:0 "$STAGE"/www
+
+    ####### Extract config
+    if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]
+    then
+        echo "Config archive $CONFIG was provided, extracting it to the root partition..."
+        tar xf "$CONFIG" -C "$STAGE"/w
+    else
+        echo "No config archive was provided, default settings will be used."
+    fi
+
+    echo "Creating ext3 root filesystem"
+    # -F: diskutil already put a FAT filesystem here, so skip the interactive
+    # "overwrite existing filesystem?" prompt (we are replacing it on purpose).
+    mke2fs -F -t ext3 -q -d "$STAGE" "$DEVICE_ROOT"
+
+    echo "Copying EdgeOS kernel to boot partition"
+    # macOS may have auto-mounted the freshly formatted boot slice; make sure it is
+    # unmounted before mounting it at our chosen mount point.
+    diskutil unmount "$DEVICE_BOOT" >/dev/null 2>&1 || true
+    diskutil mount -mountPoint "$BOOT_MNT" "$DEVICE_BOOT" >/dev/null
+    cp "$DIR"/vmlinux.tmp "$BOOT_MNT"/vmlinux.64
+    cp "$DIR"/vmlinux.tmp.md5 "$BOOT_MNT"/vmlinux.64.md5
+    diskutil unmount "$DEVICE_BOOT" >/dev/null
+
+    # Mark the root partition as Linux so the router recognizes it.
+    set_linux_root_type
 else
-    echo "No config archive was provided, default settings will be used."
+    echo "Copying EdgeOS kernel to boot partition"
+    cp "$DIR"/vmlinux.tmp $BOOT_MNT/vmlinux.64
+    cp "$DIR"/vmlinux.tmp.md5 $BOOT_MNT/vmlinux.64.md5
+
+    echo "Copying EdgeOS system image to root partition"
+    mv "$DIR"/squashfs.tmp $ROOT_MNT/squashfs.img
+    mv "$DIR"/squashfs.tmp.md5 $ROOT_MNT/squashfs.img.md5
+
+    echo "Copying version file to the root partition"
+    mv "$DIR"/version.tmp $ROOT_MNT/version
+
+    # Writable data dir
+    echo "Creating EdgeOS writable data directories"
+    mkdir $ROOT_MNT/w
+    mkdir $ROOT_MNT/www
+
+    chown 33:0 $ROOT_MNT/www
+
+    ####### Extract config
+    if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]
+    then
+        echo "Config archive $CONFIG was provided, extracting it to the root partition..."
+        tar xf "$CONFIG" -C $ROOT_MNT/w
+    else
+        echo "No config archive was provided, default settings will be used."
+    fi
 fi
 
 echo "Waiting for disk sync..."
 sync
 
 echo "Unmounting filesystems on $DEVICE..."
-umount $ROOT_MNT
-umount $BOOT_MNT
+if [ "$OS" = "Darwin" ]
+then
+    diskutil eject "$DEVICE"
+else
+    umount $ROOT_MNT
+    umount $BOOT_MNT
+fi
 
 echo "Done. You can now plug the USB drive back into your router and boot it."
